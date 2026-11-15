@@ -74,6 +74,9 @@ pub use window::{
     CloseStage, CursorIcon, UiClock, UiWindow, WindowCloseHandler, WindowId, WindowMetricsChange,
     WindowRegistry, WindowState,
 };
+pub use platform::runner::{
+    compose_rgba_over_rgb, AppHandler, AppRunner, AppWindowContext, SoftPresenter, WindowConfig,
+};
 
 /// Current crate version, useful to Gallery diagnostics without importing
 /// package metadata at runtime.

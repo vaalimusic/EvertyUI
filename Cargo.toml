@@ -15,6 +15,7 @@ cosmic-text = "0.19.0"
 resvg = { version = "0.45.1", default-features = false }
 unicode-segmentation = "1"
 winit = "0.30"
+softbuffer = { version = "0.4", default-features = false }
 
 [[bench]]
 name = "layout_10k"

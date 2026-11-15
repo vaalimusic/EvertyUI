@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dialog;
 pub mod dpi;
 pub mod geometry;
 mod highlight;
@@ -26,6 +27,7 @@ pub mod virtual_list;
 pub mod widgets;
 pub mod window;
 
+pub use dialog::{ConfirmChoice, ConfirmationDialog, Dialog, DialogAction};
 pub use dpi::{DpiScale, DpiScaleError};
 pub use geometry::{
     Constraints, Insets, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, PhysicalPoint,
@@ -47,13 +49,18 @@ pub use renderer::{
     logical_viewport, raster_rect, BitmapIcon, IconId, LogicalPxValue, PaintBuilder, PaintCommand,
     PaintError, PaintLayer, PaintList, PaintOp, Renderer, Rgba8Renderer,
 };
-pub use scroll::{scrollbar_thumb, ScrollArea, ScrollAreaLayout, ScrollAxis, ScrollState};
+pub use scroll::{
+    scrollbar_thumb, ScrollAction, ScrollArea, ScrollAreaLayout, ScrollAxis, ScrollbarController,
+    ScrollState,
+};
 pub use split_pane::{SplitPane, SplitPaneLayout};
 pub use text::{
     FontFamily, FontUsage, FontWeight, GlyphCacheStats, GlyphImage, PositionedGlyph, TextLayout,
     TextMetrics, TextStyle, TextSystem,
 };
-pub use text_field::{caret_visible, Movement, TextEdit, TextField};
+pub use text_field::{
+    caret_visible, Clipboard, Movement, TextDisplayMode, TextEdit, TextField,
+};
 pub use theme::{Color, Theme, ThemeColors, ThemeMetrics};
 pub use tooltip::{TooltipManager, TooltipPlacement, TooltipTarget};
 pub use virtual_list::VirtualList;

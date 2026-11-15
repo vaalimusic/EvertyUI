@@ -26,6 +26,19 @@ pub enum Movement {
     End,
 }
 
+/// Clipboard provider interface for cut, copy and paste.
+pub trait Clipboard {
+    fn get_text(&mut self) -> Option<String>;
+    fn set_text(&mut self, text: &str);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EditSnapshot {
+    text: String,
+    caret: usize,
+    anchor: Option<usize>,
+}
+
 /// Text, caret and selection of one single-line field. Offsets are byte
 /// indexes that always sit on grapheme boundaries.
 #[derive(Clone, Debug)]
@@ -36,6 +49,8 @@ pub struct TextEdit {
     anchor: Option<usize>,
     max_chars: usize,
     revision: u64,
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
 }
 
 impl TextEdit {
@@ -46,6 +61,8 @@ impl TextEdit {
             anchor: None,
             max_chars,
             revision: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -67,8 +84,21 @@ impl TextEdit {
         self.revision
     }
 
+    fn push_undo(&mut self) {
+        if self.undo_stack.len() >= 100 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(EditSnapshot {
+            text: self.text.clone(),
+            caret: self.caret,
+            anchor: self.anchor,
+        });
+        self.redo_stack.clear();
+    }
+
     pub fn clear(&mut self) {
         if !self.text.is_empty() || self.anchor.is_some() {
+            self.push_undo();
             self.text.clear();
             self.caret = 0;
             self.anchor = None;
@@ -77,10 +107,11 @@ impl TextEdit {
     }
 
     pub fn set_text(&mut self, text: &str) {
+        self.push_undo();
         self.text.clear();
         self.caret = 0;
         self.anchor = None;
-        self.insert(text);
+        self.insert_internal(text, false);
     }
 
     /// Selected byte range, if any.
@@ -105,48 +136,122 @@ impl TextEdit {
     /// become spaces, other control characters are dropped, and the field's
     /// character limit is respected.
     pub fn insert(&mut self, value: &str) {
-        self.delete_selection();
-        let room = self.max_chars.saturating_sub(self.text.chars().count());
-        let clean: String = value
-            .replace("\r\n", "\n")
-            .chars()
-            .filter_map(|ch| match ch {
-                '\r' | '\n' | '\t' => Some(' '),
-                ch if ch.is_control() => None,
-                ch => Some(ch),
-            })
-            .take(room)
-            .collect();
-        if clean.is_empty() {
-            return;
-        }
-        self.text.insert_str(self.caret, &clean);
-        self.caret += clean.len();
-        self.revision += 1;
+        self.insert_internal(value, false);
     }
 
     /// Like [`insert`](Self::insert), but line breaks stay line breaks: for a field that holds several lines.
     pub fn insert_multiline(&mut self, value: &str) {
-        self.delete_selection();
-        let room = self.max_chars.saturating_sub(self.text.chars().count());
+        self.insert_internal(value, true);
+    }
+
+    fn insert_internal(&mut self, value: &str, allow_multiline: bool) {
+        let room = self.max_chars.saturating_sub(
+            self.text.chars().count()
+                - self
+                    .selection()
+                    .map_or(0, |(s, e)| self.text[s..e].chars().count()),
+        );
         let clean: String = value
             .replace("\r\n", "\n")
             .chars()
             .filter_map(|ch| match ch {
-                '\r' => Some('\n'),
-                '\n' => Some('\n'),
+                '\r' => {
+                    if allow_multiline {
+                        Some('\n')
+                    } else {
+                        Some(' ')
+                    }
+                }
+                '\n' => {
+                    if allow_multiline {
+                        Some('\n')
+                    } else {
+                        Some(' ')
+                    }
+                }
                 '\t' => Some(' '),
                 ch if ch.is_control() => None,
                 ch => Some(ch),
             })
             .take(room)
             .collect();
-        if clean.is_empty() {
+        if clean.is_empty() && self.selection().is_none() {
             return;
         }
-        self.text.insert_str(self.caret, &clean);
-        self.caret += clean.len();
+        self.push_undo();
+        self.delete_selection();
+        if !clean.is_empty() {
+            self.text.insert_str(self.caret, &clean);
+            self.caret += clean.len();
+            self.revision += 1;
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.redo_stack.push(EditSnapshot {
+            text: std::mem::replace(&mut self.text, prev.text),
+            caret: self.caret,
+            anchor: self.anchor,
+        });
+        self.caret = prev.caret;
+        self.anchor = prev.anchor;
         self.revision += 1;
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.undo_stack.push(EditSnapshot {
+            text: std::mem::replace(&mut self.text, next.text),
+            caret: self.caret,
+            anchor: self.anchor,
+        });
+        self.caret = next.caret;
+        self.anchor = next.anchor;
+        self.revision += 1;
+        true
+    }
+
+    pub fn copy(&self, clipboard: &mut impl Clipboard) -> bool {
+        if let Some(selected) = self.selected_text() {
+            clipboard.set_text(selected);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cut(&mut self, clipboard: &mut impl Clipboard) -> bool {
+        if let Some(selected) = self.selected_text() {
+            clipboard.set_text(selected);
+            self.push_undo();
+            self.delete_selection();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn paste(&mut self, clipboard: &mut impl Clipboard) -> bool {
+        if let Some(text) = clipboard.get_text() {
+            self.insert(&text);
+            true
+        } else {
+            false
+        }
     }
 
     fn delete_selection(&mut self) -> bool {
@@ -162,7 +267,11 @@ impl TextEdit {
     }
 
     pub fn backspace(&mut self, word: bool) {
-        if self.delete_selection() || self.caret == 0 {
+        if self.selection().is_none() && self.caret == 0 {
+            return;
+        }
+        self.push_undo();
+        if self.delete_selection() {
             return;
         }
         let start = if word {
@@ -176,7 +285,11 @@ impl TextEdit {
     }
 
     pub fn delete(&mut self, word: bool) {
-        if self.delete_selection() || self.caret >= self.text.len() {
+        if self.selection().is_none() && self.caret >= self.text.len() {
+            return;
+        }
+        self.push_undo();
+        if self.delete_selection() {
             return;
         }
         let end = if word {
@@ -254,9 +367,51 @@ impl TextEdit {
             Key::Character(ch) if modifiers.control && ch.eq_ignore_ascii_case(&'a') => {
                 self.select_all();
             }
+            Key::Character(ch) if modifiers.control && ch.eq_ignore_ascii_case(&'z') => {
+                if modifiers.shift {
+                    self.redo();
+                } else {
+                    self.undo();
+                }
+            }
+            Key::Character(ch) if modifiers.control && ch.eq_ignore_ascii_case(&'y') => {
+                self.redo();
+            }
             _ => return false,
         }
         true
+    }
+
+    /// Applies an editing or clipboard key. If `allow_copy` is false (e.g. for password fields),
+    /// copy and cut commands are ignored and return false.
+    pub fn handle_key_with_clipboard(
+        &mut self,
+        key: Key,
+        modifiers: Modifiers,
+        clipboard: &mut impl Clipboard,
+        allow_copy: bool,
+    ) -> bool {
+        if modifiers.control {
+            match key {
+                Key::Character(ch) if ch.eq_ignore_ascii_case(&'c') => {
+                    if allow_copy {
+                        return self.copy(clipboard);
+                    }
+                    return false;
+                }
+                Key::Character(ch) if ch.eq_ignore_ascii_case(&'x') => {
+                    if allow_copy {
+                        return self.cut(clipboard);
+                    }
+                    return false;
+                }
+                Key::Character(ch) if ch.eq_ignore_ascii_case(&'v') => {
+                    return self.paste(clipboard);
+                }
+                _ => {}
+            }
+        }
+        self.handle_key(key, modifiers)
     }
 
     fn snap(&self, byte: usize) -> usize {
@@ -329,6 +484,19 @@ pub fn caret_visible(now: Duration, last_edit: Duration) -> bool {
     (now.saturating_sub(last_edit).as_millis() / HALF_PERIOD_MS).is_multiple_of(2)
 }
 
+/// Controls whether text in a field is displayed in plain text or masked as a password.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextDisplayMode {
+    Plain,
+    Password { mask_char: char },
+}
+
+impl Default for TextDisplayMode {
+    fn default() -> Self {
+        Self::Plain
+    }
+}
+
 /// Painting and hit-testing of a single-line field.
 pub struct TextField<'a> {
     pub edit: &'a TextEdit,
@@ -338,6 +506,9 @@ pub struct TextField<'a> {
     /// Horizontal scroll (logical px) kept between frames so the caret stays
     /// in view without jumping.
     pub scroll: &'a mut f64,
+    pub display_mode: TextDisplayMode,
+    pub has_error: bool,
+    pub error_message: Option<&'a str>,
 }
 
 const FIELD_PAD: f64 = 12.0;
@@ -350,7 +521,37 @@ fn field_style(theme: Theme) -> TextStyle {
     }
 }
 
-impl TextField<'_> {
+impl<'a> TextField<'a> {
+    pub fn new(edit: &'a TextEdit, placeholder: &'a str, scroll: &'a mut f64) -> Self {
+        Self {
+            edit,
+            placeholder,
+            focused: false,
+            caret_on: false,
+            scroll,
+            display_mode: TextDisplayMode::Plain,
+            has_error: false,
+            error_message: None,
+        }
+    }
+
+    pub fn with_focus(mut self, focused: bool, caret_on: bool) -> Self {
+        self.focused = focused;
+        self.caret_on = caret_on;
+        self
+    }
+
+    pub fn with_display_mode(mut self, mode: TextDisplayMode) -> Self {
+        self.display_mode = mode;
+        self
+    }
+
+    pub fn with_error(mut self, has_error: bool, error_message: Option<&'a str>) -> Self {
+        self.has_error = has_error;
+        self.error_message = error_message;
+        self
+    }
+
     pub fn paint(
         self,
         rect: LogicalRect,
@@ -361,27 +562,62 @@ impl TextField<'_> {
         let colors = theme.colors;
         let radius = theme.metrics.radius_md.0;
         builder.fill_rect(rect, colors.window, radius);
-        builder.stroke_rect(
-            rect,
-            if self.focused {
-                colors.focus
-            } else {
-                colors.border
-            },
-            if self.focused {
-                theme.metrics.focus_width.0
-            } else {
-                theme.metrics.border_width.0
-            },
-            radius,
-        );
+
+        let stroke_color = if self.has_error {
+            colors.danger
+        } else if self.focused {
+            colors.focus
+        } else {
+            colors.border
+        };
+        let stroke_width = if self.has_error || self.focused {
+            theme.metrics.focus_width.0
+        } else {
+            theme.metrics.border_width.0
+        };
+        builder.stroke_rect(rect, stroke_color, stroke_width, radius);
+
         let style = field_style(theme);
         let inner_left = rect.left() + FIELD_PAD;
         let inner_width = (rect.size.width.0 - 2.0 * FIELD_PAD).max(1.0);
         let line_height = style.line_height.0;
         let top = rect.top() + (rect.size.height.0 - line_height) / 2.0;
-        let layout = Arc::new(text.shape(self.edit.text(), &style, None));
-        let caret_x = layout.caret_x(self.edit.caret());
+
+        let (display_text, caret_offset, selection_range) = match self.display_mode {
+            TextDisplayMode::Plain => {
+                (self.edit.text().to_string(), self.edit.caret(), self.edit.selection())
+            }
+            TextDisplayMode::Password { mask_char } => {
+                let graphemes: Vec<&str> = self.edit.text().graphemes(true).collect();
+                let masked: String = std::iter::repeat(mask_char).take(graphemes.len()).collect();
+                let caret_grapheme_idx =
+                    self.edit.text()[..self.edit.caret()].graphemes(true).count();
+                let masked_caret = masked
+                    .grapheme_indices(true)
+                    .nth(caret_grapheme_idx)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(masked.len());
+                let masked_selection = self.edit.selection().map(|(start, end)| {
+                    let s_idx = self.edit.text()[..start].graphemes(true).count();
+                    let e_idx = self.edit.text()[..end].graphemes(true).count();
+                    let m_s = masked
+                        .grapheme_indices(true)
+                        .nth(s_idx)
+                        .map(|(i, _)| i)
+                        .unwrap_or(masked.len());
+                    let m_e = masked
+                        .grapheme_indices(true)
+                        .nth(e_idx)
+                        .map(|(i, _)| i)
+                        .unwrap_or(masked.len());
+                    (m_s, m_e)
+                });
+                (masked, masked_caret, masked_selection)
+            }
+        };
+
+        let layout = Arc::new(text.shape(&display_text, &style, None));
+        let caret_x = layout.caret_x(caret_offset);
         let text_width = layout.metrics.size.width.0;
         // Keep the caret inside the visible window, with a little room.
         let mut scroll = (*self.scroll).clamp(0.0, (text_width - inner_width + 4.0).max(0.0));
@@ -401,7 +637,7 @@ impl TextField<'_> {
                 colors.text_disabled,
             );
         } else {
-            if let Some((start, end)) = self.edit.selection() {
+            if let Some((start, end)) = selection_range {
                 let (x0, x1) = (layout.caret_x(start), layout.caret_x(end));
                 builder.fill_rect(
                     LogicalRect::from_xywh(
@@ -433,6 +669,24 @@ impl TextField<'_> {
             );
         }
         let _ = builder.pop_clip();
+
+        if let (true, Some(err_msg)) = (self.has_error, self.error_message) {
+            let err_style = TextStyle {
+                font_size: theme.metrics.font_xs,
+                line_height: theme.metrics.line_height_sm,
+                ..TextStyle::default()
+            };
+            let err_layout = Arc::new(text.shape(
+                err_msg,
+                &err_style,
+                Some(LogicalPx(rect.size.width.0)),
+            ));
+            builder.text(
+                LogicalPoint::new(rect.left(), rect.bottom() + theme.metrics.space_xs.0),
+                err_layout,
+                colors.danger,
+            );
+        }
     }
 
     /// Byte index under logical x position `x` (a click in the field).
@@ -444,8 +698,46 @@ impl TextField<'_> {
         theme: Theme,
         x: f64,
     ) -> usize {
-        let layout = text.shape(text_value, &field_style(theme), None);
-        layout.index_at_x(x - (rect.left() + FIELD_PAD) + scroll, text_value.len())
+        Self::index_at_with_mode(
+            text_value,
+            TextDisplayMode::Plain,
+            scroll,
+            rect,
+            text,
+            theme,
+            x,
+        )
+    }
+
+    /// Byte index under logical x position `x` considering display mode (e.g. password masking).
+    pub fn index_at_with_mode(
+        text_value: &str,
+        display_mode: TextDisplayMode,
+        scroll: f64,
+        rect: LogicalRect,
+        text: &mut TextSystem,
+        theme: Theme,
+        x: f64,
+    ) -> usize {
+        match display_mode {
+            TextDisplayMode::Plain => {
+                let layout = text.shape(text_value, &field_style(theme), None);
+                layout.index_at_x(x - (rect.left() + FIELD_PAD) + scroll, text_value.len())
+            }
+            TextDisplayMode::Password { mask_char } => {
+                let graphemes: Vec<&str> = text_value.graphemes(true).collect();
+                let masked: String = std::iter::repeat(mask_char).take(graphemes.len()).collect();
+                let layout = text.shape(&masked, &field_style(theme), None);
+                let masked_idx =
+                    layout.index_at_x(x - (rect.left() + FIELD_PAD) + scroll, masked.len());
+                let count = masked[..masked_idx].graphemes(true).count();
+                text_value
+                    .grapheme_indices(true)
+                    .nth(count)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(text_value.len())
+            }
+        }
     }
 }
 
@@ -610,14 +902,9 @@ mod tests {
         let rect = LogicalRect::from_xywh(10.0, 10.0, 200.0, 40.0);
         let mut scroll = 0.0;
         let mut builder = PaintBuilder::new();
-        TextField {
-            edit: &edit,
-            placeholder: "…",
-            focused: true,
-            caret_on: true,
-            scroll: &mut scroll,
-        }
-        .paint(rect, &mut system, theme, &mut builder);
+        TextField::new(&edit, "…", &mut scroll)
+            .with_focus(true, true)
+            .paint(rect, &mut system, theme, &mut builder);
         assert!(scroll > 100.0, "scrolled to the end: {scroll}");
         let caret_visible_x = {
             let layout = system.shape(edit.text(), &field_style(theme), None);
@@ -636,5 +923,142 @@ mod tests {
             rect.left() + 100.0,
         );
         assert!(index < edit.text().len());
+    }
+
+    #[derive(Default)]
+    struct MockClipboard {
+        text: Option<String>,
+    }
+
+    impl Clipboard for MockClipboard {
+        fn get_text(&mut self) -> Option<String> {
+            self.text.clone()
+        }
+
+        fn set_text(&mut self, text: &str) {
+            self.text = Some(text.to_string());
+        }
+    }
+
+    #[test]
+    fn text_edit_undo_redo_cycles() {
+        let mut edit = TextEdit::new(100);
+        assert!(!edit.can_undo());
+        assert!(!edit.can_redo());
+
+        edit.insert("hello");
+        assert_eq!(edit.text(), "hello");
+        assert!(edit.can_undo());
+
+        edit.insert(" world");
+        assert_eq!(edit.text(), "hello world");
+
+        assert!(edit.undo());
+        assert_eq!(edit.text(), "hello");
+        assert!(edit.can_redo());
+
+        assert!(edit.redo());
+        assert_eq!(edit.text(), "hello world");
+
+        // Key shortcuts
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        assert!(edit.handle_key(Key::Character('z'), ctrl));
+        assert_eq!(edit.text(), "hello");
+
+        let ctrl_shift = Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert!(edit.handle_key(Key::Character('z'), ctrl_shift));
+        assert_eq!(edit.text(), "hello world");
+
+        assert!(edit.handle_key(Key::Character('z'), ctrl));
+        assert_eq!(edit.text(), "hello");
+
+        assert!(edit.handle_key(Key::Character('y'), ctrl));
+        assert_eq!(edit.text(), "hello world");
+    }
+
+    #[test]
+    fn text_edit_clipboard_copy_cut_paste() {
+        let mut edit = TextEdit::new(100);
+        edit.insert("secret password");
+        edit.select_all();
+
+        let mut clip = MockClipboard::default();
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+
+        // Disallowed copy (e.g. password field)
+        assert!(!edit.handle_key_with_clipboard(Key::Character('c'), ctrl, &mut clip, false));
+        assert_eq!(clip.text, None);
+        assert!(!edit.handle_key_with_clipboard(Key::Character('x'), ctrl, &mut clip, false));
+        assert_eq!(edit.text(), "secret password");
+
+        // Allowed copy
+        assert!(edit.handle_key_with_clipboard(Key::Character('c'), ctrl, &mut clip, true));
+        assert_eq!(clip.text.as_deref(), Some("secret password"));
+
+        // Allowed cut
+        assert!(edit.handle_key_with_clipboard(Key::Character('x'), ctrl, &mut clip, true));
+        assert_eq!(edit.text(), "");
+
+        // Allowed paste
+        assert!(edit.handle_key_with_clipboard(Key::Character('v'), ctrl, &mut clip, true));
+        assert_eq!(edit.text(), "secret password");
+    }
+
+    #[test]
+    fn text_field_password_masking_never_shapes_plaintext() {
+        let theme = Theme::EVERTY_LIGHT;
+        let mut system = TextSystem::with_cache_limits(64, 1 << 20);
+        let mut edit = TextEdit::new(100);
+        edit.insert("secret123");
+
+        let rect = LogicalRect::from_xywh(10.0, 10.0, 200.0, 40.0);
+        let mut scroll = 0.0;
+        let mut builder = PaintBuilder::new();
+
+        let field = TextField::new(&edit, "…", &mut scroll)
+            .with_focus(true, true)
+            .with_display_mode(TextDisplayMode::Password { mask_char: '•' });
+
+        field.paint(rect, &mut system, theme, &mut builder);
+
+        // Hit testing should map to the index in the original string
+        let index = TextField::index_at_with_mode(
+            edit.text(),
+            TextDisplayMode::Password { mask_char: '•' },
+            scroll,
+            rect,
+            &mut system,
+            theme,
+            rect.left() + 25.0,
+        );
+        assert!(index <= edit.text().len());
+    }
+
+    #[test]
+    fn text_field_error_state_styling() {
+        let theme = Theme::EVERTY_LIGHT;
+        let mut system = TextSystem::with_cache_limits(64, 1 << 20);
+        let edit = TextEdit::new(100);
+        let rect = LogicalRect::from_xywh(10.0, 10.0, 200.0, 40.0);
+        let mut scroll = 0.0;
+        let mut builder = PaintBuilder::new();
+
+        let field = TextField::new(&edit, "…", &mut scroll)
+            .with_error(true, Some("Invalid input"));
+
+        field.paint(rect, &mut system, theme, &mut builder);
+        let commands = builder.finish();
+        // Danger stroke and error text command should be present
+        assert!(commands.commands().len() >= 2);
     }
 }

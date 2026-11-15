@@ -124,10 +124,17 @@ pub struct RoutedEvent {
     pub consumed: bool,
 }
 
+#[derive(Clone, Debug)]
+struct FocusScope {
+    eligible: Vec<WidgetId>,
+    focused: Option<WidgetId>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FocusManager {
     eligible: Vec<WidgetId>,
     focused: Option<WidgetId>,
+    scopes: Vec<FocusScope>,
 }
 
 impl FocusManager {
@@ -184,6 +191,43 @@ impl FocusManager {
         if self.focused == Some(id) {
             self.focused = None;
         }
+    }
+
+    /// Push an isolated focus scope (e.g. for modal dialogs).
+    /// All subsequent tab navigation is restricted to `order`.
+    /// Initial focus is placed on `initial` (or the first eligible widget).
+    pub fn push_scope(
+        &mut self,
+        order: impl IntoIterator<Item = (WidgetId, bool, bool)>,
+        initial: Option<WidgetId>,
+    ) {
+        self.scopes.push(FocusScope {
+            eligible: std::mem::take(&mut self.eligible),
+            focused: self.focused,
+        });
+        self.set_tab_order(order);
+        if let Some(init) = initial {
+            self.focus(Some(init));
+        } else if let Some(&first) = self.eligible.first() {
+            self.focused = Some(first);
+        } else {
+            self.focused = None;
+        }
+    }
+
+    /// Pops the active focus scope and restores the previous tab order and focus.
+    /// Returns the widget that was focused within the popped scope.
+    pub fn pop_scope(&mut self) -> Option<WidgetId> {
+        let previous = self.scopes.pop()?;
+        let popped_focus = self.focused;
+        self.eligible = previous.eligible;
+        self.focused = previous.focused;
+        popped_focus
+    }
+
+    /// Whether any modal focus scopes are currently active.
+    pub fn has_active_scope(&self) -> bool {
+        !self.scopes.is_empty()
     }
 }
 
@@ -785,5 +829,38 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn focus_scopes_trap_navigation_and_restore_previous_focus() {
+        let mut focus = FocusManager::default();
+        focus.set_tab_order([
+            (WidgetId(1), true, true),
+            (WidgetId(2), true, true),
+            (WidgetId(3), true, true),
+        ]);
+        focus.focus(Some(WidgetId(2)));
+        assert_eq!(focus.focused(), Some(WidgetId(2)));
+
+        // Open modal dialog: push new scope
+        focus.push_scope(
+            [
+                (WidgetId(10), true, true),
+                (WidgetId(11), true, true),
+            ],
+            Some(WidgetId(10)),
+        );
+        assert!(focus.has_active_scope());
+        assert_eq!(focus.focused(), Some(WidgetId(10)));
+
+        // Tab inside modal scope
+        assert_eq!(focus.focus_next(false), Some(WidgetId(11)));
+        assert_eq!(focus.focus_next(false), Some(WidgetId(10)));
+
+        // Close modal: pop scope
+        let popped = focus.pop_scope();
+        assert_eq!(popped, Some(WidgetId(10)));
+        assert!(!focus.has_active_scope());
+        assert_eq!(focus.focused(), Some(WidgetId(2)));
     }
 }

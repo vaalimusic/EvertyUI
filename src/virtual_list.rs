@@ -9,6 +9,91 @@ use std::ops::Range;
 
 use crate::{LogicalPx, LogicalRect, LogicalSize, ScrollState};
 
+/// Stable identifier for a list item to preserve selection across sorting, filtering, and reordering.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ItemId(pub u64);
+
+/// Tracks selection by stable identity rather than volatile list index.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KeyedSelection<Id = ItemId> {
+    pub selected: Option<Id>,
+}
+
+impl<Id: Copy + PartialEq> KeyedSelection<Id> {
+    pub fn new() -> Self {
+        Self { selected: None }
+    }
+
+    pub fn with_selected(selected: Option<Id>) -> Self {
+        Self { selected }
+    }
+
+    pub fn select(&mut self, id: Id) {
+        self.selected = Some(id);
+    }
+
+    pub fn clear(&mut self) {
+        self.selected = None;
+    }
+
+    pub fn selected(&self) -> Option<Id> {
+        self.selected
+    }
+
+    pub fn is_selected(&self, id: &Id) -> bool {
+        self.selected.as_ref() == Some(id)
+    }
+
+    /// Finds the index of the selected item in the current filtered/sorted items slice.
+    pub fn selected_index(&self, items: &[Id]) -> Option<usize> {
+        let selected = self.selected?;
+        items.iter().position(|item| *item == selected)
+    }
+
+    /// Selects an item by its current index in `items`.
+    pub fn select_by_index(&mut self, index: usize, items: &[Id]) -> bool {
+        if let Some(&item) = items.get(index) {
+            self.selected = Some(item);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Navigates selection by delta (-1 = up/previous, +1 = down/next) within `items`.
+    pub fn navigate(&mut self, delta: isize, items: &[Id]) -> Option<Id> {
+        if items.is_empty() {
+            return None;
+        }
+        let current_index = self.selected_index(items);
+        let next_index = match (current_index, delta) {
+            (Some(idx), _) => {
+                let target = idx as isize + delta;
+                target.clamp(0, (items.len() - 1) as isize) as usize
+            }
+            (None, d) if d >= 0 => 0,
+            (None, _) => items.len() - 1,
+        };
+        let new_selected = items[next_index];
+        self.selected = Some(new_selected);
+        Some(new_selected)
+    }
+
+    /// Ensures the currently selected item is scrolled into visible view.
+    pub fn ensure_selected_visible(
+        &self,
+        items: &[Id],
+        list: &VirtualList,
+        scroll: &mut ScrollState,
+    ) -> bool {
+        if let Some(index) = self.selected_index(items) {
+            list.ensure_visible(index, scroll)
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VirtualList {
     pub item_count: usize,
@@ -269,5 +354,39 @@ mod tests {
             // Logical range and mapping do not depend on the scale at all.
             assert_eq!(list.visible_range(&scroll), list.visible_range(&scroll));
         }
+    }
+
+    #[test]
+    fn keyed_selection_preserves_identity_across_reordering_and_filtering() {
+        let device_a = ItemId(101);
+        let device_b = ItemId(102);
+        let device_c = ItemId(103);
+
+        // Initial list: [A, B, C]
+        let items_initial = vec![device_a, device_b, device_c];
+        let mut selection = KeyedSelection::new();
+        selection.select(device_b);
+        assert_eq!(selection.selected(), Some(device_b));
+        assert_eq!(selection.selected_index(&items_initial), Some(1));
+
+        // User searches or filters: only [C, B] match
+        let items_filtered = vec![device_c, device_b];
+        // Selection remains attached to device B, but its index is now 1 in the filtered list
+        assert_eq!(selection.selected(), Some(device_b));
+        assert_eq!(selection.selected_index(&items_filtered), Some(1));
+
+        // User sorts by name descending: [C, B, A]
+        let items_sorted = vec![device_c, device_b, device_a];
+        assert_eq!(selection.selected(), Some(device_b));
+        assert_eq!(selection.selected_index(&items_sorted), Some(1));
+
+        // Navigate down (+1) -> moves to device A
+        assert_eq!(selection.navigate(1, &items_sorted), Some(device_a));
+        assert_eq!(selection.selected(), Some(device_a));
+
+        // Filter where device A is omitted: [C, B]
+        assert_eq!(selection.selected_index(&items_filtered), None);
+        // But the ID is still preserved in case the filter changes back!
+        assert_eq!(selection.selected(), Some(device_a));
     }
 }

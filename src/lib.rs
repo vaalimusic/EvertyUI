@@ -65,7 +65,7 @@ pub use text_field::{
 };
 pub use theme::{Color, Theme, ThemeColors, ThemeMetrics};
 pub use tooltip::{TooltipManager, TooltipPlacement, TooltipTarget};
-pub use virtual_list::VirtualList;
+pub use virtual_list::{ItemId, KeyedSelection, VirtualList};
 pub use widgets::{
     Button, ButtonState, ButtonVariant, CheckState, Checkbox, HorizontalTextAlign, IconButton,
     Label, Switch, TabBar, TabEvent, TabItem, WidgetEvent,

@@ -41,7 +41,7 @@ struct EditSnapshot {
 
 /// Text, caret and selection of one single-line field. Offsets are byte
 /// indexes that always sit on grapheme boundaries.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TextEdit {
     text: String,
     caret: usize,
@@ -51,6 +51,26 @@ pub struct TextEdit {
     revision: u64,
     undo_stack: Vec<EditSnapshot>,
     redo_stack: Vec<EditSnapshot>,
+    is_password: bool,
+    preedit: Option<String>,
+}
+
+impl std::fmt::Debug for TextEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("TextEdit");
+        if self.is_password {
+            d.field("text", &"[REDACTED]");
+        } else {
+            d.field("text", &self.text);
+        }
+        d.field("caret", &self.caret)
+            .field("anchor", &self.anchor)
+            .field("max_chars", &self.max_chars)
+            .field("revision", &self.revision)
+            .field("is_password", &self.is_password)
+            .field("is_composing", &self.is_composing())
+            .finish()
+    }
 }
 
 impl TextEdit {
@@ -63,6 +83,73 @@ impl TextEdit {
             revision: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            is_password: false,
+            preedit: None,
+        }
+    }
+
+    /// Creates a secure password editor. Plaintext is never stored in undo/redo history,
+    /// `Debug` redacts the text, and copy/cut commands are safely absorbed without leaking.
+    pub fn new_password(max_chars: usize) -> Self {
+        Self {
+            text: String::new(),
+            caret: 0,
+            anchor: None,
+            max_chars,
+            revision: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            is_password: true,
+            preedit: None,
+        }
+    }
+
+    pub fn with_password_mode(mut self, is_password: bool) -> Self {
+        self.is_password = is_password;
+        if is_password {
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+        }
+        self
+    }
+
+    pub fn is_password(&self) -> bool {
+        self.is_password
+    }
+
+    pub fn is_composing(&self) -> bool {
+        self.preedit.is_some()
+    }
+
+    pub fn preedit(&self) -> Option<&str> {
+        self.preedit.as_deref()
+    }
+
+    /// Handles IME composition events (Start, Preedit Update, Commit, End).
+    pub fn handle_ime(&mut self, event: &crate::ImeEvent) -> bool {
+        match event {
+            crate::ImeEvent::Start => {
+                self.preedit = Some(String::new());
+                self.revision += 1;
+                true
+            }
+            crate::ImeEvent::Update { text, .. } => {
+                self.preedit = Some(text.clone());
+                self.revision += 1;
+                true
+            }
+            crate::ImeEvent::Commit(text) => {
+                self.preedit = None;
+                self.insert(text);
+                true
+            }
+            crate::ImeEvent::End => {
+                let had_preedit = self.preedit.take().is_some();
+                if had_preedit {
+                    self.revision += 1;
+                }
+                had_preedit
+            }
         }
     }
 
@@ -85,6 +172,9 @@ impl TextEdit {
     }
 
     fn push_undo(&mut self) {
+        if self.is_password {
+            return;
+        }
         if self.undo_stack.len() >= 100 {
             self.undo_stack.remove(0);
         }
@@ -377,13 +467,20 @@ impl TextEdit {
             Key::Character(ch) if modifiers.control && ch.eq_ignore_ascii_case(&'y') => {
                 self.redo();
             }
+            // If IME composition is active, Enter finishes composition without triggering form submit.
+            Key::Enter if self.is_composing() => {
+                if let Some(text) = self.preedit.take() {
+                    self.insert(&text);
+                }
+                return true;
+            }
             _ => return false,
         }
         true
     }
 
-    /// Applies an editing or clipboard key. If `allow_copy` is false (e.g. for password fields),
-    /// copy and cut commands are ignored and return false.
+    /// Applies an editing or clipboard key. If in password mode or `allow_copy` is false,
+    /// copy and cut commands are absorbed (consumed) so they never leak to a terminal or remote session.
     pub fn handle_key_with_clipboard(
         &mut self,
         key: Key,
@@ -394,16 +491,18 @@ impl TextEdit {
         if modifiers.control {
             match key {
                 Key::Character(ch) if ch.eq_ignore_ascii_case(&'c') => {
-                    if allow_copy {
-                        return self.copy(clipboard);
+                    if self.is_password || !allow_copy {
+                        // Absorb: consumed so it never leaks!
+                        return true;
                     }
-                    return false;
+                    return self.copy(clipboard);
                 }
                 Key::Character(ch) if ch.eq_ignore_ascii_case(&'x') => {
-                    if allow_copy {
-                        return self.cut(clipboard);
+                    if self.is_password || !allow_copy {
+                        // Absorb: consumed so it never leaks!
+                        return true;
                     }
-                    return false;
+                    return self.cut(clipboard);
                 }
                 Key::Character(ch) if ch.eq_ignore_ascii_case(&'v') => {
                     return self.paste(clipboard);
@@ -523,13 +622,18 @@ fn field_style(theme: Theme) -> TextStyle {
 
 impl<'a> TextField<'a> {
     pub fn new(edit: &'a TextEdit, placeholder: &'a str, scroll: &'a mut f64) -> Self {
+        let display_mode = if edit.is_password() {
+            TextDisplayMode::Password { mask_char: '•' }
+        } else {
+            TextDisplayMode::Plain
+        };
         Self {
             edit,
             placeholder,
             focused: false,
             caret_on: false,
             scroll,
-            display_mode: TextDisplayMode::Plain,
+            display_mode,
             has_error: false,
             error_message: None,
         }
@@ -583,9 +687,26 @@ impl<'a> TextField<'a> {
         let line_height = style.line_height.0;
         let top = rect.top() + (rect.size.height.0 - line_height) / 2.0;
 
-        let (display_text, caret_offset, selection_range) = match self.display_mode {
+        let (display_text, caret_offset, selection_range, preedit_range) = match self.display_mode {
             TextDisplayMode::Plain => {
-                (self.edit.text().to_string(), self.edit.caret(), self.edit.selection())
+                if let Some(preedit) = self.edit.preedit() {
+                    let mut s = self.edit.text().to_string();
+                    let c = self.edit.caret();
+                    s.insert_str(c, preedit);
+                    (
+                        s,
+                        c + preedit.len(),
+                        self.edit.selection(),
+                        Some((c, c + preedit.len())),
+                    )
+                } else {
+                    (
+                        self.edit.text().to_string(),
+                        self.edit.caret(),
+                        self.edit.selection(),
+                        None,
+                    )
+                }
             }
             TextDisplayMode::Password { mask_char } => {
                 let graphemes: Vec<&str> = self.edit.text().graphemes(true).collect();
@@ -612,7 +733,7 @@ impl<'a> TextField<'a> {
                         .unwrap_or(masked.len());
                     (m_s, m_e)
                 });
-                (masked, masked_caret, masked_selection)
+                (masked, masked_caret, masked_selection, None)
             }
         };
 
@@ -629,7 +750,7 @@ impl<'a> TextField<'a> {
         scroll = scroll.clamp(0.0, (text_width - inner_width + 4.0).max(0.0));
         *self.scroll = scroll;
         builder.push_clip(rect.inset(crate::Insets::all(1.0)));
-        if self.edit.is_empty() {
+        if self.edit.is_empty() && self.edit.preedit().is_none() {
             let hint = Arc::new(text.shape(self.placeholder, &style, Some(LogicalPx(inner_width))));
             builder.text(
                 LogicalPoint::new(inner_left, top),
@@ -648,6 +769,19 @@ impl<'a> TextField<'a> {
                     ),
                     colors.selection,
                     2.0,
+                );
+            }
+            if let Some((p_start, p_end)) = preedit_range {
+                let (px0, px1) = (layout.caret_x(p_start), layout.caret_x(p_end));
+                builder.fill_rect(
+                    LogicalRect::from_xywh(
+                        inner_left + px0 - scroll,
+                        top + line_height - 1.5,
+                        (px1 - px0).max(1.0),
+                        1.5,
+                    ),
+                    colors.accent,
+                    0.0,
                 );
             }
             builder.text(
@@ -995,10 +1129,10 @@ mod tests {
             ..Default::default()
         };
 
-        // Disallowed copy (e.g. password field)
-        assert!(!edit.handle_key_with_clipboard(Key::Character('c'), ctrl, &mut clip, false));
+        // Disallowed copy (e.g. password field) - absorbed so it returns true, but nothing is copied
+        assert!(edit.handle_key_with_clipboard(Key::Character('c'), ctrl, &mut clip, false));
         assert_eq!(clip.text, None);
-        assert!(!edit.handle_key_with_clipboard(Key::Character('x'), ctrl, &mut clip, false));
+        assert!(edit.handle_key_with_clipboard(Key::Character('x'), ctrl, &mut clip, false));
         assert_eq!(edit.text(), "secret password");
 
         // Allowed copy
@@ -1060,5 +1194,74 @@ mod tests {
         let commands = builder.finish();
         // Danger stroke and error text command should be present
         assert!(commands.commands().len() >= 2);
+    }
+
+    #[test]
+    fn password_edit_never_stores_undo_and_redacts_debug() {
+        let mut pw = TextEdit::new_password(50);
+        assert!(pw.is_password());
+
+        pw.insert("SuperSecret123!");
+        assert_eq!(pw.text(), "SuperSecret123!");
+
+        // Undo is disabled: no history saved!
+        assert!(!pw.can_undo());
+        assert!(!pw.undo());
+        assert_eq!(pw.text(), "SuperSecret123!");
+
+        // Debug output must be redacted
+        let debug_str = format!("{:?}", pw);
+        assert!(!debug_str.contains("SuperSecret123!"));
+        assert!(debug_str.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn password_edit_absorbs_copy_and_cut_without_clipboard_leak() {
+        let mut pw = TextEdit::new_password(50);
+        pw.insert("MySecretToken");
+        pw.select_all();
+
+        let mut clip = MockClipboard::default();
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+
+        // Ctrl+C is absorbed (returns true) but does NOT copy to clipboard
+        assert!(pw.handle_key_with_clipboard(Key::Character('c'), ctrl, &mut clip, true));
+        assert_eq!(clip.text, None);
+
+        // Ctrl+X is absorbed (returns true) but does NOT copy to clipboard
+        assert!(pw.handle_key_with_clipboard(Key::Character('x'), ctrl, &mut clip, true));
+        assert_eq!(clip.text, None);
+
+        // Ctrl+V pastes allowed text
+        clip.set_text("PastedSecret");
+        assert!(pw.handle_key_with_clipboard(Key::Character('v'), ctrl, &mut clip, true));
+        assert!(pw.text().contains("PastedSecret"));
+    }
+
+    #[test]
+    fn text_edit_ime_composition_and_enter_handling() {
+        let mut edit = TextEdit::new(50);
+        assert!(!edit.is_composing());
+
+        // IME Start & Preedit
+        assert!(edit.handle_ime(&crate::ImeEvent::Start));
+        assert!(edit.is_composing());
+        assert!(edit.handle_ime(&crate::ImeEvent::Update {
+            text: "прив".into(),
+            selection: None,
+        }));
+        assert_eq!(edit.preedit(), Some("прив"));
+
+        // Enter during composition completes composition and returns true (does NOT submit form!)
+        let none = Modifiers::default();
+        assert!(edit.handle_key(Key::Enter, none));
+        assert!(!edit.is_composing());
+        assert_eq!(edit.text(), "прив");
+
+        // Subsequent Enter when not composing returns false (allows normal form submission)
+        assert!(!edit.handle_key(Key::Enter, none));
     }
 }

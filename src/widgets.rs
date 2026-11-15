@@ -7,7 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     Color, HitRegion, IconId, InputEvent, InputState, Key, LayoutId, LayoutNode, LogicalPoint,
-    LogicalPx, LogicalRect, LogicalSize, PaintBuilder, PaintLayer, TextLayout, TextStyle,
+    LogicalPx, LogicalRect, LogicalSize, Modifiers, PaintBuilder, PaintLayer, TextLayout, TextStyle,
     TextSystem, Theme, WidgetId,
 };
 
@@ -508,6 +508,589 @@ fn ellipsized_text(
     format!("{}{}", &text[..boundaries[count]], ELLIPSIS)
 }
 
+/// State of a checkbox: unchecked, checked, or mixed (indeterminate).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckState {
+    Unchecked,
+    Checked,
+    Indeterminate,
+}
+
+impl CheckState {
+    pub fn is_checked(&self) -> bool {
+        matches!(self, CheckState::Checked)
+    }
+
+    pub fn toggle(&self) -> Self {
+        match self {
+            CheckState::Unchecked => CheckState::Checked,
+            CheckState::Checked | CheckState::Indeterminate => CheckState::Unchecked,
+        }
+    }
+}
+
+/// Standard checkbox with label, focus ring, and check/indeterminate states.
+#[derive(Clone, Debug)]
+pub struct Checkbox {
+    pub id: WidgetId,
+    pub label: Option<String>,
+    pub state: CheckState,
+    pub enabled: bool,
+    armed_pointer: bool,
+    armed_keyboard: bool,
+}
+
+impl Checkbox {
+    pub fn new(id: WidgetId, label: impl Into<String>) -> Self {
+        Self {
+            id,
+            label: Some(label.into()),
+            state: CheckState::Unchecked,
+            enabled: true,
+            armed_pointer: false,
+            armed_keyboard: false,
+        }
+    }
+
+    pub fn without_label(id: WidgetId) -> Self {
+        Self {
+            id,
+            label: None,
+            state: CheckState::Unchecked,
+            enabled: true,
+            armed_pointer: false,
+            armed_keyboard: false,
+        }
+    }
+
+    pub fn with_state(mut self, state: CheckState) -> Self {
+        self.state = state;
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn hit_region(&self, rect: LogicalRect, layer: PaintLayer, paint_order: u64) -> HitRegion {
+        HitRegion {
+            id: self.id,
+            rect,
+            layer,
+            paint_order,
+            enabled: self.enabled,
+            focusable: true,
+            cursor: if self.enabled {
+                crate::CursorIcon::Pointer
+            } else {
+                crate::CursorIcon::Default
+            },
+        }
+    }
+
+    pub fn layout_node(&self, text_system: &mut TextSystem, theme: Theme) -> LayoutNode {
+        let box_size = 18.0;
+        let label_layout = self
+            .label
+            .as_ref()
+            .map(|label| text_system.shape(label, &text_style(theme), None));
+        let gap = if label_layout.is_some() {
+            theme.metrics.space_sm.0
+        } else {
+            0.0
+        };
+        let label_width = label_layout
+            .as_ref()
+            .map_or(0.0, |layout| layout.metrics.size.width.0);
+        let height = theme.metrics.control_height_sm.0.max(box_size);
+        LayoutNode::intrinsic(
+            LayoutId(self.id.0),
+            LogicalSize::new(box_size + gap + label_width, height),
+        )
+    }
+
+    pub fn handle(
+        &mut self,
+        target: Option<WidgetId>,
+        event: &InputEvent,
+        input: &mut InputState,
+        rect: LogicalRect,
+    ) -> Option<CheckState> {
+        if !self.enabled {
+            self.armed_pointer = false;
+            self.armed_keyboard = false;
+            return None;
+        }
+        match event {
+            InputEvent::PointerDown(crate::MouseButton::Primary) if target == Some(self.id) => {
+                self.armed_pointer = true;
+                input.capture_pointer(self.id);
+                None
+            }
+            InputEvent::PointerUp(crate::MouseButton::Primary) if self.armed_pointer => {
+                self.armed_pointer = false;
+                input.release_pointer(self.id);
+                if rect.contains(input.pointer) && target == Some(self.id) {
+                    self.state = self.state.toggle();
+                    Some(self.state)
+                } else {
+                    None
+                }
+            }
+            InputEvent::Key {
+                key: Key::Space,
+                pressed,
+                ..
+            } if target == Some(self.id) => {
+                if *pressed {
+                    self.armed_keyboard = true;
+                    None
+                } else if self.armed_keyboard {
+                    self.armed_keyboard = false;
+                    self.state = self.state.toggle();
+                    Some(self.state)
+                } else {
+                    None
+                }
+            }
+            InputEvent::Key { .. } => {
+                self.armed_keyboard = false;
+                None
+            }
+            InputEvent::PointerCancel | InputEvent::WindowFocused(false) => {
+                self.armed_pointer = false;
+                self.armed_keyboard = false;
+                input.release_pointer(self.id);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn paint(
+        &self,
+        rect: LogicalRect,
+        text_system: &mut TextSystem,
+        theme: Theme,
+        input: &InputState,
+        builder: &mut PaintBuilder,
+    ) {
+        let colors = theme.colors;
+        let box_size = 18.0;
+        let box_top = rect.top() + (rect.size.height.0 - box_size) / 2.0;
+        let box_rect = LogicalRect::from_xywh(rect.left(), box_top, box_size, box_size);
+
+        let focused = input.focused() == Some(self.id);
+        let hovered = input.hovered == Some(self.id) && self.enabled;
+
+        let (fill_color, border_color) = match (self.state, self.enabled) {
+            (CheckState::Checked | CheckState::Indeterminate, true) => {
+                if hovered {
+                    (colors.accent.mix(colors.surface_hover, 0.1), colors.accent)
+                } else {
+                    (colors.accent, colors.accent)
+                }
+            }
+            (CheckState::Checked | CheckState::Indeterminate, false) => {
+                (colors.accent.mix(colors.surface, 0.5), colors.border)
+            }
+            (CheckState::Unchecked, true) => {
+                if hovered {
+                    (colors.surface_hover, colors.focus)
+                } else {
+                    (colors.surface, colors.border)
+                }
+            }
+            (CheckState::Unchecked, false) => (colors.surface, colors.border),
+        };
+
+        builder.fill_rect(box_rect, fill_color, 4.0);
+        builder.stroke_rect(box_rect, border_color, theme.metrics.border_width.0, 4.0);
+
+        if focused {
+            builder.stroke_rect(
+                box_rect.inset(crate::Insets::all(-2.0)),
+                colors.focus,
+                theme.metrics.focus_width.0,
+                6.0,
+            );
+        }
+
+        match self.state {
+            CheckState::Checked => {
+                let mark_color = if self.enabled {
+                    colors.text_on_accent
+                } else {
+                    colors.text_disabled
+                };
+                let p1 = LogicalPoint::new(box_rect.left() + 4.0, box_rect.top() + 9.5);
+                let p2 = LogicalPoint::new(box_rect.left() + 7.5, box_rect.top() + 13.0);
+                let p3 = LogicalPoint::new(box_rect.left() + 14.0, box_rect.top() + 5.5);
+                builder.stroke_path(vec![p1, p2, p3], mark_color, 2.0);
+            }
+            CheckState::Indeterminate => {
+                let mark_color = if self.enabled {
+                    colors.text_on_accent
+                } else {
+                    colors.text_disabled
+                };
+                let bar = LogicalRect::from_xywh(
+                    box_rect.left() + 4.0,
+                    box_rect.top() + (box_size - 2.5) / 2.0,
+                    box_size - 8.0,
+                    2.5,
+                );
+                builder.fill_rect(bar, mark_color, 1.0);
+            }
+            CheckState::Unchecked => {}
+        }
+
+        if let Some(ref text) = self.label {
+            let label_layout = Arc::new(text_system.shape(text, &text_style(theme), None));
+            let label_x = box_rect.right() + theme.metrics.space_sm.0;
+            let label_y =
+                rect.top() + (rect.size.height.0 - label_layout.metrics.size.height.0) / 2.0;
+            let text_color = if self.enabled {
+                colors.text_primary
+            } else {
+                colors.text_disabled
+            };
+            builder.text(LogicalPoint::new(label_x, label_y), label_layout, text_color);
+        }
+    }
+}
+
+/// A toggle switch (on/off pill switch).
+#[derive(Clone, Debug)]
+pub struct Switch {
+    pub id: WidgetId,
+    pub label: Option<String>,
+    pub on: bool,
+    pub enabled: bool,
+    armed_pointer: bool,
+    armed_keyboard: bool,
+}
+
+impl Switch {
+    pub fn new(id: WidgetId) -> Self {
+        Self {
+            id,
+            label: None,
+            on: false,
+            enabled: true,
+            armed_pointer: false,
+            armed_keyboard: false,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_on(mut self, on: bool) -> Self {
+        self.on = on;
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn hit_region(&self, rect: LogicalRect, layer: PaintLayer, paint_order: u64) -> HitRegion {
+        HitRegion {
+            id: self.id,
+            rect,
+            layer,
+            paint_order,
+            enabled: self.enabled,
+            focusable: true,
+            cursor: if self.enabled {
+                crate::CursorIcon::Pointer
+            } else {
+                crate::CursorIcon::Default
+            },
+        }
+    }
+
+    pub fn layout_node(&self, text_system: &mut TextSystem, theme: Theme) -> LayoutNode {
+        let track_width = 38.0;
+        let track_height = 22.0;
+        let label_layout = self
+            .label
+            .as_ref()
+            .map(|label| text_system.shape(label, &text_style(theme), None));
+        let gap = if label_layout.is_some() {
+            theme.metrics.space_sm.0
+        } else {
+            0.0
+        };
+        let label_width = label_layout
+            .as_ref()
+            .map_or(0.0, |layout| layout.metrics.size.width.0);
+        let height = theme.metrics.control_height_sm.0.max(track_height);
+        LayoutNode::intrinsic(
+            LayoutId(self.id.0),
+            LogicalSize::new(track_width + gap + label_width, height),
+        )
+    }
+
+    pub fn handle(
+        &mut self,
+        target: Option<WidgetId>,
+        event: &InputEvent,
+        input: &mut InputState,
+        rect: LogicalRect,
+    ) -> Option<bool> {
+        if !self.enabled {
+            self.armed_pointer = false;
+            self.armed_keyboard = false;
+            return None;
+        }
+        match event {
+            InputEvent::PointerDown(crate::MouseButton::Primary) if target == Some(self.id) => {
+                self.armed_pointer = true;
+                input.capture_pointer(self.id);
+                None
+            }
+            InputEvent::PointerUp(crate::MouseButton::Primary) if self.armed_pointer => {
+                self.armed_pointer = false;
+                input.release_pointer(self.id);
+                if rect.contains(input.pointer) && target == Some(self.id) {
+                    self.on = !self.on;
+                    Some(self.on)
+                } else {
+                    None
+                }
+            }
+            InputEvent::Key {
+                key: Key::Space | Key::Enter,
+                pressed,
+                ..
+            } if target == Some(self.id) => {
+                if *pressed {
+                    self.armed_keyboard = true;
+                    None
+                } else if self.armed_keyboard {
+                    self.armed_keyboard = false;
+                    self.on = !self.on;
+                    Some(self.on)
+                } else {
+                    None
+                }
+            }
+            InputEvent::Key { .. } => {
+                self.armed_keyboard = false;
+                None
+            }
+            InputEvent::PointerCancel | InputEvent::WindowFocused(false) => {
+                self.armed_pointer = false;
+                self.armed_keyboard = false;
+                input.release_pointer(self.id);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn paint(
+        &self,
+        rect: LogicalRect,
+        text_system: &mut TextSystem,
+        theme: Theme,
+        input: &InputState,
+        builder: &mut PaintBuilder,
+    ) {
+        let colors = theme.colors;
+        let track_width = 38.0;
+        let track_height = 22.0;
+        let track_top = rect.top() + (rect.size.height.0 - track_height) / 2.0;
+        let track_rect = LogicalRect::from_xywh(rect.left(), track_top, track_width, track_height);
+
+        let focused = input.focused() == Some(self.id);
+        let track_color = match (self.on, self.enabled) {
+            (true, true) => colors.accent,
+            (true, false) => colors.accent.mix(colors.surface, 0.5),
+            (false, true) => colors.border,
+            (false, false) => colors.border.mix(colors.surface, 0.5),
+        };
+
+        builder.fill_rect(track_rect, track_color, track_height / 2.0);
+
+        if focused {
+            builder.stroke_rect(
+                track_rect.inset(crate::Insets::all(-2.0)),
+                colors.focus,
+                theme.metrics.focus_width.0,
+                (track_height + 4.0) / 2.0,
+            );
+        }
+
+        let thumb_diameter = 16.0;
+        let thumb_pad = 3.0;
+        let thumb_x = if self.on {
+            track_rect.right() - thumb_pad - thumb_diameter
+        } else {
+            track_rect.left() + thumb_pad
+        };
+        let thumb_y = track_rect.top() + thumb_pad;
+        let thumb_rect = LogicalRect::from_xywh(thumb_x, thumb_y, thumb_diameter, thumb_diameter);
+        builder.fill_rect(thumb_rect, colors.surface, thumb_diameter / 2.0);
+
+        if let Some(ref text) = self.label {
+            let label_layout = Arc::new(text_system.shape(text, &text_style(theme), None));
+            let label_x = track_rect.right() + theme.metrics.space_sm.0;
+            let label_y =
+                rect.top() + (rect.size.height.0 - label_layout.metrics.size.height.0) / 2.0;
+            let text_color = if self.enabled {
+                colors.text_primary
+            } else {
+                colors.text_disabled
+            };
+            builder.text(LogicalPoint::new(label_x, label_y), label_layout, text_color);
+        }
+    }
+}
+
+/// A tab in a tab bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabItem {
+    pub id: WidgetId,
+    pub close_id: Option<WidgetId>,
+    pub title: String,
+    pub closable: bool,
+    pub disabled: bool,
+}
+
+impl TabItem {
+    pub fn new(id: WidgetId, title: impl Into<String>) -> Self {
+        Self {
+            id,
+            close_id: None,
+            title: title.into(),
+            closable: false,
+            disabled: false,
+        }
+    }
+
+    pub fn closable(mut self, close_id: WidgetId) -> Self {
+        self.close_id = Some(close_id);
+        self.closable = true;
+        self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+/// Events resulting from interacting with a tab bar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabEvent {
+    Selected(WidgetId),
+    Closed(WidgetId),
+}
+
+/// Tab bar managing a collection of tabs, active tab selection, and close actions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabBar {
+    pub id: WidgetId,
+    pub tabs: Vec<TabItem>,
+    pub active_tab: Option<WidgetId>,
+    pub scroll_offset: f64,
+}
+
+impl TabBar {
+    pub fn new(id: WidgetId, tabs: Vec<TabItem>, active_tab: Option<WidgetId>) -> Self {
+        Self {
+            id,
+            tabs,
+            active_tab,
+            scroll_offset: 0.0,
+        }
+    }
+
+    pub fn select(&mut self, tab_id: WidgetId) -> bool {
+        if self.tabs.iter().any(|t| t.id == tab_id && !t.disabled) {
+            self.active_tab = Some(tab_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn close(&mut self, tab_id: WidgetId) -> bool {
+        if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+            self.tabs.remove(pos);
+            if self.active_tab == Some(tab_id) {
+                self.active_tab = self.tabs.get(pos).or_else(|| self.tabs.last()).map(|t| t.id);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handles keyboard arrow navigation between tabs.
+    pub fn handle_key(&mut self, key: Key, _modifiers: Modifiers) -> Option<TabEvent> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let current_index = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+
+        match key {
+            Key::ArrowLeft => {
+                let next = if current_index == 0 {
+                    self.tabs.len() - 1
+                } else {
+                    current_index - 1
+                };
+                let id = self.tabs[next].id;
+                self.select(id);
+                Some(TabEvent::Selected(id))
+            }
+            Key::ArrowRight => {
+                let next = (current_index + 1) % self.tabs.len();
+                let id = self.tabs[next].id;
+                self.select(id);
+                Some(TabEvent::Selected(id))
+            }
+            _ => None,
+        }
+    }
+
+    /// Handles pointer down: distinguishes clicking a tab vs clicking its close button.
+    pub fn handle_pointer_down(&mut self, target: WidgetId) -> Option<TabEvent> {
+        let hit_close = self
+            .tabs
+            .iter()
+            .find(|t| !t.disabled && t.close_id == Some(target))
+            .map(|t| t.id);
+        if let Some(id) = hit_close {
+            self.close(id);
+            return Some(TabEvent::Closed(id));
+        }
+
+        let hit_tab = self
+            .tabs
+            .iter()
+            .find(|t| !t.disabled && t.id == target)
+            .map(|t| t.id);
+        if let Some(id) = hit_tab {
+            self.select(id);
+            return Some(TabEvent::Selected(id));
+        }
+
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +1399,123 @@ mod tests {
                 .unwrap();
             assert_eq!(icon_tint, expected);
         }
+    }
+
+    #[test]
+    fn checkbox_toggle_and_indeterminate_cycle() {
+        let mut checkbox = Checkbox::new(WidgetId(10), "Remember me");
+        assert_eq!(checkbox.state, CheckState::Unchecked);
+
+        let mut input = InputState::default();
+        let rect = LogicalRect::from_xywh(0.0, 0.0, 150.0, 30.0);
+
+        // Click to toggle
+        let down = InputEvent::PointerDown(MouseButton::Primary);
+        checkbox.handle(Some(WidgetId(10)), &down, &mut input, rect);
+        input.pointer = LogicalPoint::new(10.0, 10.0);
+        let up = InputEvent::PointerUp(MouseButton::Primary);
+        assert_eq!(
+            checkbox.handle(Some(WidgetId(10)), &up, &mut input, rect),
+            Some(CheckState::Checked)
+        );
+        assert_eq!(checkbox.state, CheckState::Checked);
+
+        // Space key toggles
+        let space_down = InputEvent::Key {
+            key: Key::Space,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        };
+        checkbox.handle(Some(WidgetId(10)), &space_down, &mut input, rect);
+        let space_up = InputEvent::Key {
+            key: Key::Space,
+            pressed: false,
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(
+            checkbox.handle(Some(WidgetId(10)), &space_up, &mut input, rect),
+            Some(CheckState::Unchecked)
+        );
+
+        // Indeterminate state toggles to Unchecked
+        checkbox.state = CheckState::Indeterminate;
+        assert_eq!(checkbox.state.toggle(), CheckState::Unchecked);
+    }
+
+    #[test]
+    fn switch_toggle_pointer_and_keyboard() {
+        let mut switch = Switch::new(WidgetId(20)).with_label("Notifications");
+        assert!(!switch.on);
+
+        let mut input = InputState::default();
+        let rect = LogicalRect::from_xywh(0.0, 0.0, 150.0, 30.0);
+
+        // Pointer click
+        let down = InputEvent::PointerDown(MouseButton::Primary);
+        switch.handle(Some(WidgetId(20)), &down, &mut input, rect);
+        input.pointer = LogicalPoint::new(10.0, 10.0);
+        let up = InputEvent::PointerUp(MouseButton::Primary);
+        assert_eq!(
+            switch.handle(Some(WidgetId(20)), &up, &mut input, rect),
+            Some(true)
+        );
+        assert!(switch.on);
+
+        // Enter key toggles
+        let enter_down = InputEvent::Key {
+            key: Key::Enter,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        };
+        switch.handle(Some(WidgetId(20)), &enter_down, &mut input, rect);
+        let enter_up = InputEvent::Key {
+            key: Key::Enter,
+            pressed: false,
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(
+            switch.handle(Some(WidgetId(20)), &enter_up, &mut input, rect),
+            Some(false)
+        );
+        assert!(!switch.on);
+    }
+
+    #[test]
+    fn tab_bar_selection_closing_and_keyboard_navigation() {
+        let tabs = vec![
+            TabItem::new(WidgetId(1), "Tab 1").closable(WidgetId(101)),
+            TabItem::new(WidgetId(2), "Tab 2").closable(WidgetId(102)),
+            TabItem::new(WidgetId(3), "Tab 3").closable(WidgetId(103)),
+        ];
+        let mut bar = TabBar::new(WidgetId(10), tabs, Some(WidgetId(1)));
+
+        // Arrow navigation
+        assert_eq!(
+            bar.handle_key(Key::ArrowRight, Modifiers::default()),
+            Some(TabEvent::Selected(WidgetId(2)))
+        );
+        assert_eq!(bar.active_tab, Some(WidgetId(2)));
+
+        assert_eq!(
+            bar.handle_key(Key::ArrowLeft, Modifiers::default()),
+            Some(TabEvent::Selected(WidgetId(1)))
+        );
+        assert_eq!(bar.active_tab, Some(WidgetId(1)));
+
+        // Pointer down on close button closes tab, does not select
+        assert_eq!(
+            bar.handle_pointer_down(WidgetId(102)),
+            Some(TabEvent::Closed(WidgetId(2)))
+        );
+        assert_eq!(bar.tabs.len(), 2);
+        assert_eq!(bar.tabs[0].id, WidgetId(1));
+        assert_eq!(bar.tabs[1].id, WidgetId(3));
+
+        // Pointer down on Tab 3 selects it
+        assert_eq!(
+            bar.handle_pointer_down(WidgetId(3)),
+            Some(TabEvent::Selected(WidgetId(3)))
+        );
+        assert_eq!(bar.active_tab, Some(WidgetId(3)));
     }
 }

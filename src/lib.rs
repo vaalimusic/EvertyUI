@@ -18,6 +18,7 @@ pub mod platform;
 pub mod popup;
 pub mod renderer;
 pub mod scroll;
+pub mod semantics;
 pub mod split_pane;
 pub mod text;
 pub mod text_field;
@@ -53,6 +54,7 @@ pub use scroll::{
     scrollbar_thumb, ScrollAction, ScrollArea, ScrollAreaLayout, ScrollAxis, ScrollbarController,
     ScrollState,
 };
+pub use semantics::{SemanticNode, SemanticRole, SemanticTree};
 pub use split_pane::{SplitPane, SplitPaneLayout};
 pub use text::{
     FontFamily, FontUsage, FontWeight, GlyphCacheStats, GlyphImage, PositionedGlyph, TextLayout,
@@ -65,10 +67,12 @@ pub use theme::{Color, Theme, ThemeColors, ThemeMetrics};
 pub use tooltip::{TooltipManager, TooltipPlacement, TooltipTarget};
 pub use virtual_list::VirtualList;
 pub use widgets::{
-    Button, ButtonState, ButtonVariant, HorizontalTextAlign, IconButton, Label, WidgetEvent,
+    Button, ButtonState, ButtonVariant, CheckState, Checkbox, HorizontalTextAlign, IconButton,
+    Label, Switch, TabBar, TabEvent, TabItem, WidgetEvent,
 };
 pub use window::{
-    CursorIcon, UiClock, UiWindow, WindowId, WindowMetricsChange, WindowRegistry, WindowState,
+    CloseStage, CursorIcon, UiClock, UiWindow, WindowCloseHandler, WindowId, WindowMetricsChange,
+    WindowRegistry, WindowState,
 };
 
 /// Current crate version, useful to Gallery diagnostics without importing

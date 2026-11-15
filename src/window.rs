@@ -232,6 +232,103 @@ impl UiClock {
     }
 }
 
+/// Stage in a window close lifecycle, supporting background task completion and unsaved changes confirmation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CloseStage {
+    /// Window is operating normally, no close requested.
+    #[default]
+    Idle,
+    /// Close was requested while a background task (e.g. OCR, export, save) is executing.
+    PendingTask { cancelable: bool },
+    /// Waiting for user confirmation ("Save changes before closing?").
+    Confirming,
+    /// Saving changes before exiting.
+    Saving,
+    /// Safe to destroy the window and exit.
+    ReadyToClose,
+}
+
+/// Tracks window close requests across asynchronous operations and unsaved changes confirmation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WindowCloseHandler {
+    pub stage: CloseStage,
+    pub task_description: Option<String>,
+    pub task_progress: Option<f32>,
+    pub has_unsaved_changes: bool,
+    close_requested: bool,
+}
+
+impl WindowCloseHandler {
+    pub fn new(has_unsaved_changes: bool) -> Self {
+        Self {
+            stage: CloseStage::Idle,
+            task_description: None,
+            task_progress: None,
+            has_unsaved_changes,
+            close_requested: false,
+        }
+    }
+
+    /// Handles a window close event. Repeated calls preserve the single active request.
+    pub fn request_close(
+        &mut self,
+        is_task_running: bool,
+        task_name: Option<&str>,
+        cancelable: bool,
+    ) -> CloseStage {
+        self.close_requested = true;
+        if is_task_running {
+            self.task_description = task_name.map(str::to_string);
+            self.stage = CloseStage::PendingTask { cancelable };
+        } else if self.has_unsaved_changes {
+            self.stage = CloseStage::Confirming;
+        } else {
+            self.stage = CloseStage::ReadyToClose;
+        }
+        self.stage
+    }
+
+    /// Called when an active background task completes.
+    /// If the task succeeded and a close was requested, proceeds to confirmation or exit.
+    /// If the task failed (e.g. save error), the close request is aborted so the user can fix the issue.
+    pub fn on_task_finished(&mut self, success: bool) -> CloseStage {
+        self.task_description = None;
+        self.task_progress = None;
+        if !self.close_requested {
+            self.stage = CloseStage::Idle;
+            return self.stage;
+        }
+        if !success {
+            // Error occurred: keep window open and accessible!
+            self.close_requested = false;
+            self.stage = CloseStage::Idle;
+            return self.stage;
+        }
+        if self.has_unsaved_changes {
+            self.stage = CloseStage::Confirming;
+        } else {
+            self.stage = CloseStage::ReadyToClose;
+        }
+        self.stage
+    }
+
+    pub fn confirm_discard(&mut self) -> CloseStage {
+        self.stage = CloseStage::ReadyToClose;
+        self.stage
+    }
+
+    pub fn confirm_save(&mut self) -> CloseStage {
+        self.stage = CloseStage::Saving;
+        self.stage
+    }
+
+    pub fn cancel_close(&mut self) -> CloseStage {
+        self.close_requested = false;
+        self.stage = CloseStage::Idle;
+        self.stage
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +444,35 @@ mod tests {
         assert!(state.set_cursor(CursorIcon::ResizeHorizontal));
         assert!(state.set_ime_enabled(true));
         assert!(!state.set_ime_enabled(true));
+    }
+
+    #[test]
+    fn window_close_handler_lifecycle_states() {
+        // Case 1: no active task, no unsaved changes -> ready to close immediately
+        let mut handler = WindowCloseHandler::new(false);
+        assert_eq!(handler.request_close(false, None, false), CloseStage::ReadyToClose);
+
+        // Case 2: active task running -> defers close
+        let mut handler = WindowCloseHandler::new(true);
+        assert_eq!(
+            handler.request_close(true, Some("Exporting PDF"), true),
+            CloseStage::PendingTask { cancelable: true }
+        );
+        // Duplicate request preserves pending task
+        assert_eq!(
+            handler.request_close(true, Some("Exporting PDF"), true),
+            CloseStage::PendingTask { cancelable: true }
+        );
+
+        // Task finishes successfully -> transitions to confirming unsaved changes
+        assert_eq!(handler.on_task_finished(true), CloseStage::Confirming);
+
+        // Cancel close request -> returns to idle
+        assert_eq!(handler.cancel_close(), CloseStage::Idle);
+
+        // Task finishes with error -> returns to idle so user can fix issue
+        let mut handler2 = WindowCloseHandler::new(true);
+        handler2.request_close(true, Some("Saving file"), false);
+        assert_eq!(handler2.on_task_finished(false), CloseStage::Idle);
     }
 }
